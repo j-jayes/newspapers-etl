@@ -21,17 +21,20 @@ A production-ready web scraper for the Kungliga Biblioteket (KB) digital newspap
 ### Setup
 
 1. Clone this repository:
+
 ```bash
-git clone https://github.com/yourusername/kb-newspaper-scraper.git
+git clone https://github.com/j-jayes/newspapers-etl.git
 cd kb-newspaper-scraper
 ```
 
 2. Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 The `requirements.txt` file should include:
+
 ```
 selenium
 webdriver-manager
@@ -89,6 +92,7 @@ This repository includes a GitHub Actions workflow that can process an entire mo
 ## Output Structure
 
 Downloaded files are organized in this structure:
+
 ```
 kb_newspapers/
 ├── Newspaper Title 1/
@@ -112,6 +116,7 @@ kb_newspapers/
 ### Logs
 
 Detailed logs are saved to:
+
 - `kb_scraper.log`: Main scraper log file
 
 ## Contributing
