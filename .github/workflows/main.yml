@@ -70,6 +70,12 @@ jobs:
           DAYS_IN_MONTH=$(python -c "import calendar; print(calendar.monthrange(${YEAR}, ${MONTH})[1])")
           echo "Processing ${DAYS_IN_MONTH} days for ${YEAR}-${MONTH}"
           
+          # Create an empty state file if it doesn't exist
+          if [ ! -f "scraper_state.json" ]; then
+            echo "{}" > scraper_state.json
+            echo "Created empty scraper_state.json file"
+          fi
+          
           # Process each day one by one
           for day in $(seq 1 $DAYS_IN_MONTH); do
             # Format with leading zeros
@@ -85,7 +91,23 @@ jobs:
             python src/01-scrape-images.py --start-date "$DATE" --end-date "$NEXT_DATE" --download-dir kb_newspapers --headless
             
             # Commit changes after each day to preserve progress
-            git add kb_newspapers/ scraper_state.json
+            # Check if the kb_newspapers directory exists before attempting to add it
+            if [ -d "kb_newspapers" ]; then
+              git add kb_newspapers/
+            else
+              echo "Warning: kb_newspapers directory not found, skipping git add"
+            fi
+            
+            # Check if the state file exists
+            if [ -f "scraper_state.json" ]; then
+              git add scraper_state.json
+            else
+              echo "Warning: scraper_state.json not found, skipping git add"
+              # Create an empty state file to avoid errors in future iterations
+              echo "{}" > scraper_state.json
+            fi
+            
+            # Attempt to commit and push
             git commit -m "Add scraped newspaper images for $DATE [skip ci]" || echo "No changes to commit for $DATE"
             git push origin main || echo "Failed to push for $DATE, will retry with the next day"
             
@@ -109,21 +131,47 @@ jobs:
       - name: Commit and push changes for other operations
         if: ${{ github.event.inputs.operation != 'start-month' }}
         run: |
-          git add kb_newspapers/ scraper_state.json
+          # Create an empty state file if it doesn't exist
+          if [ ! -f "scraper_state.json" ]; then
+            echo "{}" > scraper_state.json
+            echo "Created empty scraper_state.json file"
+          fi
+          
+          # Check if the kb_newspapers directory exists before attempting to add it
+          if [ -d "kb_newspapers" ]; then
+            git add kb_newspapers/
+          else
+            echo "Warning: kb_newspapers directory not found, skipping git add"
+          fi
+          
+          # Check if the state file exists
+          if [ -f "scraper_state.json" ]; then
+            git add scraper_state.json
+          else
+            echo "Warning: scraper_state.json not found, skipping git add"
+          fi
+          
           git commit -m "Update scraped data for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
-          git push origin main
+          git push origin main || echo "Failed to push changes"
           
       # Upload logs as artifacts
       - name: Upload scraper logs
         uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
         with:
           name: scraper-logs
           path: |
+            *.log
             kb_newspaper_cron.log
             kb_scraper.log
             
       - name: Upload scraper state
         uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
         with:
           name: scraper-state
-          path: scraper_state.json
+          path: |
+            scraper_state.json
+            *state*.json
