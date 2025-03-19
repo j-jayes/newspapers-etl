@@ -90,7 +90,18 @@ jobs:
             # Run the scraper for this day
             python src/01-scrape-images.py --start-date "$DATE" --end-date "$NEXT_DATE" --download-dir kb_newspapers --headless
             
-            # Commit changes after each day to preserve progress
+            # Pull the latest changes to avoid conflicts
+            git fetch origin main
+            
+            # Attempt to merge any remote changes; use ours (local) strategy for conflicts
+            if git merge origin/main -X ours --no-edit; then
+              echo "Successfully merged remote changes"
+            else
+              echo "Merge conflicts detected, resolving with our version"
+              git reset --mixed origin/main
+              git add -A
+            fi
+            
             # Check if the kb_newspapers directory exists before attempting to add it
             if [ -d "kb_newspapers" ]; then
               git add kb_newspapers/
@@ -107,9 +118,24 @@ jobs:
               echo "{}" > scraper_state.json
             fi
             
-            # Attempt to commit and push
+            # Attempt to commit and push with retries
             git commit -m "Add scraped newspaper images for $DATE [skip ci]" || echo "No changes to commit for $DATE"
-            git push origin main || echo "Failed to push for $DATE, will retry with the next day"
+            
+            # Try to push with up to 3 retries
+            MAX_RETRIES=3
+            for attempt in $(seq 1 $MAX_RETRIES); do
+              if git push origin main; then
+                echo "Successfully pushed changes for $DATE"
+                break
+              else
+                if [ $attempt -lt $MAX_RETRIES ]; then
+                  echo "Push failed on attempt $attempt of $MAX_RETRIES, pulling and retrying..."
+                  git pull origin main --rebase
+                else
+                  echo "Failed to push after $MAX_RETRIES attempts for $DATE, continuing with next day"
+                fi
+              fi
+            done
             
             # Optional: Add a small delay between days to avoid rate limiting
             sleep 5
@@ -137,6 +163,18 @@ jobs:
             echo "Created empty scraper_state.json file"
           fi
           
+          # Pull the latest changes to avoid conflicts
+          git fetch origin main
+            
+          # Attempt to merge any remote changes; use ours (local) strategy for conflicts
+          if git merge origin/main -X ours --no-edit; then
+            echo "Successfully merged remote changes"
+          else
+            echo "Merge conflicts detected, resolving with our version"
+            git reset --mixed origin/main
+            git add -A
+          fi
+          
           # Check if the kb_newspapers directory exists before attempting to add it
           if [ -d "kb_newspapers" ]; then
             git add kb_newspapers/
@@ -151,8 +189,24 @@ jobs:
             echo "Warning: scraper_state.json not found, skipping git add"
           fi
           
+          # Attempt to commit and push with retries
           git commit -m "Update scraped data for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
-          git push origin main || echo "Failed to push changes"
+          
+          # Try to push with up to 3 retries
+          MAX_RETRIES=3
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            if git push origin main; then
+              echo "Successfully pushed changes"
+              break
+            else
+              if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "Push failed on attempt $attempt of $MAX_RETRIES, pulling and retrying..."
+                git pull origin main --rebase
+              else
+                echo "Failed to push after $MAX_RETRIES attempts"
+              fi
+            fi
+          done
           
       # Upload logs as artifacts
       - name: Upload scraper logs
