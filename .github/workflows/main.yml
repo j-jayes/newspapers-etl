@@ -26,87 +26,112 @@ on:
         description: 'Newspaper IDs (comma-separated, leave empty for default)'
         required: false
         default: ''
-  
-  # Uncomment this section when ready to set up a scheduled CRON job
-  # schedule:
-  #   - cron: '0 2 * * *'  # Run daily at 2 AM UTC
 
 jobs:
-  run-scraper:
+  # This job generates a dynamic matrix (list of valid days) for the selected month.
+  generate-matrix:
+    if: ${{ github.event.inputs.operation == 'start-month' }}
     runs-on: ubuntu-latest
-    
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        name: Generate matrix for days in month
+        run: |
+          python -c "import calendar, json, os; 
+year = int(os.environ['YEAR']); 
+month = int(os.environ['MONTH']); 
+last_day = calendar.monthrange(year, month)[1]; 
+days = list(range(1, last_day+1)); 
+print(json.dumps({'day': days}))" > matrix.json
+          MATRIX=$(cat matrix.json)
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+        env:
+          YEAR: ${{ github.event.inputs.year }}
+          MONTH: ${{ github.event.inputs.month }}
+
+  # This job runs the scraper one day at a time (using the matrix) when starting a new month.
+  start-month:
+    if: ${{ github.event.inputs.operation == 'start-month' }}
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history so we can push back
-      
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-      
       - name: Install Chrome
         run: |
           wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
-      
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      - name: Cache newspaper downloads
-        uses: actions/cache@v4
+      - name: Run scraper for day ${{ matrix.day }}
+        run: |
+          # Compute the start date and the next day (as the end date)
+          DATE=$(date -d "${{ github.event.inputs.year }}-${{ github.event.inputs.month }}-${{ matrix.day }}" +"%Y-%m-%d")
+          NEXT_DATE=$(date -d "$DATE + 1 day" +"%Y-%m-%d")
+          echo "Scraping from $DATE to $NEXT_DATE"
+          python src/01-scrape-images.py --start-date "$DATE" --end-date "$NEXT_DATE" --download-dir kb_newspapers --headless
+      - name: Upload artifacts for day ${{ matrix.day }}
+        uses: actions/upload-artifact@v4
         with:
-          path: kb_newspapers
-          key: kb-newspapers-${{ github.sha }}
-          restore-keys: |
-            kb-newspapers-
-      
-      - name: Cache scraper state
-        uses: actions/cache@v4
+          name: scraper-logs-day-${{ matrix.day }}
+          path: |
+            kb_newspaper_cron.log
+            kb_scraper.log
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+      - name: Commit and push changes
+        run: |
+          git add kb_newspapers/ scraper_state.json
+          git commit -m "Add scraped newspaper images for day ${{ matrix.day }} of ${{ github.event.inputs.year }}-${{ github.event.inputs.month }} [skip ci]" || echo "No changes to commit"
+          git push origin main
+
+  # This job handles the other operations that do not require date-range parameters.
+  run-scraper-other:
+    if: ${{ github.event.inputs.operation != 'start-month' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          path: scraper_state.json
-          key: scraper-state-${{ github.sha }}
-          restore-keys: |
-            scraper-state-
-            
-      - name: Pull latest changes
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install Chrome
         run: |
-          git pull origin main
-      
-      - name: Start new month (if selected)
-        if: ${{ github.event.inputs.operation == 'start-month' }}
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+      - name: Install dependencies
         run: |
-          python src/01-scrape-images.py \
-            --year ${{ github.event.inputs.year }} \
-            --month ${{ github.event.inputs.month }} \
-            --download-dir kb_newspapers \
-            ${{ github.event.inputs.newspaper_ids != '' && format('--newspapers {0}', github.event.inputs.newspaper_ids) || '' }}
-      
-      - name: Continue scraping (if selected)
-        if: ${{ github.event.inputs.operation == 'continue-scraping' }}
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run scraper for operation ${{ github.event.inputs.operation }}
         run: |
-          python src/01-scrape-images.py \
-            --download-dir kb_newspapers
-      
-      - name: Retry failed days (if selected)
-        if: ${{ github.event.inputs.operation == 'retry-failed' }}
-        run: |
-          python src/01-scrape-images.py \
-            --retry-failed \
-            --download-dir kb_newspapers
-      
-      - name: Verify month (if selected)
-        if: ${{ github.event.inputs.operation == 'verify-month' }}
-        run: |
-          python src/01-scrape-images.py \
-            --verify-month \
-            --download-dir kb_newspapers
-      
+          if [ "${{ github.event.inputs.operation }}" = "continue-scraping" ]; then
+            python src/01-scrape-images.py --download-dir kb_newspapers --headless
+          elif [ "${{ github.event.inputs.operation }}" = "retry-failed" ]; then
+            python src/01-scrape-images.py --retry-failed --download-dir kb_newspapers --headless
+          elif [ "${{ github.event.inputs.operation }}" = "verify-month" ]; then
+            python src/01-scrape-images.py --verify-month --download-dir kb_newspapers --headless
+          fi
       - name: Upload scraper logs
         uses: actions/upload-artifact@v4
         with:
@@ -114,27 +139,17 @@ jobs:
           path: |
             kb_newspaper_cron.log
             kb_scraper.log
-      
       - name: Upload scraper state
         uses: actions/upload-artifact@v4
         with:
           name: scraper-state
           path: scraper_state.json
-      
-      # Optional: upload downloaded newspapers as artifacts
-      - name: Upload downloaded newspapers
-        uses: actions/upload-artifact@v4
-        with:
-          name: kb-newspapers
-          path: kb_newspapers/
-          
       - name: Configure Git
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          
       - name: Commit and push changes
         run: |
           git add kb_newspapers/ scraper_state.json
-          git commit -m "Add scraped newspaper images for ${{ github.event.inputs.year }}-${{ github.event.inputs.month }} [skip ci]" || echo "No changes to commit"
+          git commit -m "Update scraped data for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
           git push origin main
