@@ -37,12 +37,12 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Fetch all history so we can push back
       
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: '3.9'
       
@@ -59,7 +59,7 @@ jobs:
           pip install -r requirements.txt
       
       - name: Cache newspaper downloads
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: kb_newspapers
           key: kb-newspapers-${{ github.sha }}
@@ -67,7 +67,7 @@ jobs:
             kb-newspapers-
       
       - name: Cache scraper state
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: scraper_state.json
           key: scraper-state-${{ github.sha }}
@@ -108,7 +108,7 @@ jobs:
             --download-dir kb_newspapers
       
       - name: Upload scraper logs
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: scraper-logs
           path: |
@@ -116,7 +116,7 @@ jobs:
             kb_scraper.log
       
       - name: Upload scraper state
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: scraper-state
           path: scraper_state.json
@@ -124,7 +124,7 @@ jobs:
       # Optional: upload downloaded newspapers as artifacts
       # This might be large - comment out if you don't want to upload
       - name: Upload downloaded newspapers
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: kb-newspapers
           path: kb_newspapers/
