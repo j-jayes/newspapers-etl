@@ -39,13 +39,13 @@ jobs:
         name: Generate matrix for days in month
         run: |
           python -c "import calendar, json, os; 
-year = int(os.environ['YEAR']); 
-month = int(os.environ['MONTH']); 
-last_day = calendar.monthrange(year, month)[1]; 
-days = list(range(1, last_day+1)); 
-print(json.dumps({'day': days}))" > matrix.json
-          MATRIX=$(cat matrix.json)
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          year = int(os.environ['YEAR']); 
+          month = int(os.environ['MONTH']); 
+          last_day = calendar.monthrange(year, month)[1]; 
+          days = list(range(1, last_day+1)); 
+          print(json.dumps({'day': days}))" > matrix.json
+                    MATRIX=$(cat matrix.json)
+                    echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
         env:
           YEAR: ${{ github.event.inputs.year }}
           MONTH: ${{ github.event.inputs.month }}
