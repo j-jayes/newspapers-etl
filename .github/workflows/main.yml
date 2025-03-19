@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
+        with:
+          fetch-depth: 0  # Fetch all history so we can push back
       
       - name: Set up Python
         uses: actions/setup-python@v2
@@ -54,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install selenium webdriver-manager requests
+          pip install -r requirements.txt
       
       - name: Cache newspaper downloads
         uses: actions/cache@v2
@@ -71,11 +73,15 @@ jobs:
           key: scraper-state-${{ github.sha }}
           restore-keys: |
             scraper-state-
+            
+      - name: Pull latest changes
+        run: |
+          git pull origin main
       
       - name: Start new month (if selected)
         if: ${{ github.event.inputs.operation == 'start-month' }}
         run: |
-          python kb_newspaper_cron.py \
+          python src/01-scrape-images.py \
             --year ${{ github.event.inputs.year }} \
             --month ${{ github.event.inputs.month }} \
             --download-dir kb_newspapers \
@@ -84,20 +90,20 @@ jobs:
       - name: Continue scraping (if selected)
         if: ${{ github.event.inputs.operation == 'continue-scraping' }}
         run: |
-          python kb_newspaper_cron.py \
+          python src/01-scrape-images.py \
             --download-dir kb_newspapers
       
       - name: Retry failed days (if selected)
         if: ${{ github.event.inputs.operation == 'retry-failed' }}
         run: |
-          python kb_newspaper_cron.py \
+          python src/01-scrape-images.py \
             --retry-failed \
             --download-dir kb_newspapers
       
       - name: Verify month (if selected)
         if: ${{ github.event.inputs.operation == 'verify-month' }}
         run: |
-          python kb_newspaper_cron.py \
+          python src/01-scrape-images.py \
             --verify-month \
             --download-dir kb_newspapers
       
@@ -122,3 +128,14 @@ jobs:
         with:
           name: kb-newspapers
           path: kb_newspapers/
+          
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+      - name: Commit and push changes
+        run: |
+          git add kb_newspapers/ scraper_state.json
+          git commit -m "Add scraped newspaper images for ${{ github.event.inputs.year }}-${{ github.event.inputs.month }} [skip ci]" || echo "No changes to commit"
+          git push origin main
