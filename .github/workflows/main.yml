@@ -55,8 +55,8 @@ jobs:
 
       - name: Set up Google Drive credentials
         run: |
-          echo '${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT }}' > service-account.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=service-account.json" >> $GITHUB_ENV
+          echo '${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT }}' > newspapers-454313-7a72698b783e.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=newspapers-454313-7a72698b783e.json" >> $GITHUB_ENV
 
       - name: Process days sequentially (start-month)
         if: ${{ github.event.inputs.operation == 'start-month' }}
