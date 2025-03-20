@@ -162,14 +162,20 @@ def get_or_create_drive_folder(service, folder_name: str, parent_id: Optional[st
 @retry()
 def share_drive_folder(service, folder_id: str, email: str):
     """
-    Share a Google Drive folder with a specified email.
+    Share a Google Drive folder with a specified email if not already shared.
     """
+    if is_folder_shared_with(service, folder_id, email):
+        logger.info(f"Folder {folder_id} is already shared with {email}. Skipping sharing.")
+        return
+
     permission = {
         'type': 'user',
         'role': 'writer',
         'emailAddress': email
     }
-    service.permissions().create(fileId=folder_id, body=permission, fields='id').execute()
+    service.permissions().create(
+        fileId=folder_id, body=permission, fields='id'
+    ).execute()
     logger.info(f"Shared folder ID {folder_id} with {email}")
 
 def file_exists_in_drive_folder(service, file_name: str, folder_id: str) -> bool:
@@ -180,6 +186,20 @@ def file_exists_in_drive_folder(service, file_name: str, folder_id: str) -> bool
     response = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
     files = response.get('files', [])
     return len(files) > 0
+
+def is_folder_shared_with(service, folder_id: str, email: str) -> bool:
+    """
+    Check if a folder is already shared with the given email.
+    """
+    response = service.permissions().list(
+        fileId=folder_id,
+        fields="permissions(id, emailAddress)"
+    ).execute()
+    permissions = response.get("permissions", [])
+    for permission in permissions:
+        if permission.get("emailAddress") == email:
+            return True
+    return False
 # --- End Google Drive Integration ---
 
 @dataclass
