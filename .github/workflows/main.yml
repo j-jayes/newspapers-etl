@@ -1,7 +1,6 @@
 name: KB Newspaper Scraper
 
 on:
-  # For manual triggering
   workflow_dispatch:
     inputs:
       year:
@@ -28,65 +27,44 @@ on:
         default: ''
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
     steps:
-
-      - name: Free up disk space
-        run: |
-          echo "Before cleanup:"
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          echo "After cleanup:"
-          df -h
-
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-          
+        uses: actions/checkout@v3
+
       - name: Install Chrome
         run: |
           wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
-          
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Install Google Drive API libraries
-          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
-      
+
+      - name: Sleep 5 seconds
+        run: sleep 5
+
       - name: Set up Google Drive credentials
         run: |
           echo '${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT }}' > service-account.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=service-account.json" >> $GITHUB_ENV
-      
-      - name: Download drive_utils.py
-        run: |
-          wget -q https://raw.githubusercontent.com/${{ github.repository }}/main/drive_utils.py || \
-          echo "drive_utils.py not found in repository, will use local copy"
-          
-      # When starting a new month, process each day sequentially
-      - name: Start month - Process days sequentially
+
+      - name: Process days sequentially (start-month)
         if: ${{ github.event.inputs.operation == 'start-month' }}
         run: |
-          # Get days in month
           YEAR=${{ github.event.inputs.year }}
           MONTH=${{ github.event.inputs.month }}
-          
           # Determine the number of days in the month
-          DAYS_IN_MONTH=$(python -c "import calendar; print(calendar.monthrange(${YEAR}, ${MONTH})[1])")
+          DAYS_IN_MONTH=$(python -c "import calendar; print(calendar.monthrange(int('${{ github.event.inputs.year }}'), int('${{ github.event.inputs.month }}'))[1])")
           echo "Processing ${DAYS_IN_MONTH} days for ${YEAR}-${MONTH}"
           
           # Create an empty state file if it doesn't exist
@@ -95,96 +73,24 @@ jobs:
             echo "Created empty scraper_state.json file"
           fi
           
-          # Process each day one by one
+          # Process each day sequentially
           for day in $(seq 1 $DAYS_IN_MONTH); do
-            # Format with leading zeros
             DAY_PADDED=$(printf "%02d" $day)
             DATE="${YEAR}-$(printf "%02d" $MONTH)-${DAY_PADDED}"
             NEXT_DATE=$(date -d "$DATE + 1 day" +"%Y-%m-%d")
             
             echo "----------------------------------------------------------------"
-            echo "Processing day $day ($DATE) of $YEAR-$MONTH"
+            echo "Processing day $day ($DATE) of ${YEAR}-${MONTH}"
             echo "----------------------------------------------------------------"
             
-            # Run the scraper for this day with Google Drive upload
-            python 01-scrape-images.py \
+            # Run the scraper for this day (adjust the script name as needed)
+            python kb_newspaper_scraper.py \
               --start-date "$DATE" \
               --end-date "$NEXT_DATE" \
               --download-dir kb_newspapers \
               --headless \
-              --credentials-file service-account.json \
-              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
               --log-level INFO
-            
-            # Commit the state file to track progress
-            git config --global user.name "GitHub Actions"
-            git config --global user.email "actions@github.com"
-            git add scraper_state.json
-            git commit -m "Update scraper state for $DATE [skip ci]" || echo "No changes to commit for $DATE"
-            git push origin main || echo "Failed to push changes, will try again next run"
-            
-            # Optional: Add a small delay between days to avoid rate limiting
+              
             sleep 5
           done
-          
-      # Handle other operations
-      - name: Run scraper for other operations
-        if: ${{ github.event.inputs.operation != 'start-month' }}
-        run: |
-          if [ "${{ github.event.inputs.operation }}" = "continue-scraping" ]; then
-            python 01-scrape-images.py \
-              --download-dir kb_newspapers \
-              --headless \
-              --credentials-file service-account.json \
-              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
-              --log-level INFO
-          elif [ "${{ github.event.inputs.operation }}" = "retry-failed" ]; then
-            python 01-scrape-images.py \
-              --retry-failed \
-              --download-dir kb_newspapers \
-              --headless \
-              --credentials-file service-account.json \
-              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
-              --log-level INFO
-          elif [ "${{ github.event.inputs.operation }}" = "verify-month" ]; then
-            python 01-scrape-images.py \
-              --verify-month \
-              --download-dir kb_newspapers \
-              --headless \
-              --credentials-file service-account.json \
-              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
-              --log-level INFO
-          fi
-      
-      # Commit the state file regardless of operation
-      - name: Commit state file
-        if: ${{ github.event.inputs.operation != 'start-month' }}
-        run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git add scraper_state.json
-          git commit -m "Update scraper state for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
-          git push origin main || echo "Failed to push changes"
-          
-      # Upload logs as artifacts
-      - name: Upload scraper logs
-        uses: actions/upload-artifact@v4
-        if: always()
-        continue-on-error: true
-        with:
-          name: scraper-logs
-          path: |
-            *.log
-            kb_newspaper_cron.log
-            kb_scraper.log
-            drive_upload.log
-            
-      - name: Upload scraper state
-        uses: actions/upload-artifact@v4
-        if: always()
-        continue-on-error: true
-        with:
-          name: scraper-state
-          path: |
-            scraper_state.json
-            *state*.json
+          echo "All days processed for ${YEAR}-${MONTH}"

@@ -5,39 +5,40 @@ KB Newspaper Scraper
 
 A production-ready scraper for the KB newspaper archive.
 Fetches newspaper images from the KB digital archive based on date ranges.
-Now uploads to Google Drive instead of storing in Git.
+Uploads files to Google Drive under a top-level folder (default: "newspapers")
+which is shared with a specified email address.
 """
 
 import os
 import re
 import time
-import json
 import logging
 import argparse
 import requests
-from typing import List, Tuple, Optional, Dict, Any, Union
-from dataclasses import dataclass, asdict
+import hashlib
+import functools
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.remote.webelement import WebElement
 from webdriver_manager.chrome import ChromeDriverManager
-from urllib.parse import urlparse, unquote
-from pathlib import Path
 
-# Import Google Drive uploader
-try:
-    from src.drive_utils import GoogleDriveUploader
-except ImportError:
-    logging.warning("GoogleDriveUploader not found. Will download files locally only.")
-    GoogleDriveUploader = None
+# --- Configuration via Environment Variables ---
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "newspapers-454313-7a72698b783e.json")
+SHARED_EMAIL = os.environ.get("SHARED_EMAIL", "j0nathanjayes@gmail.com")
+TOP_FOLDER_NAME = os.environ.get("DRIVE_TOP_FOLDER", "newspapers")
+# -----------------------------------------------------
 
-
-# Configure logging
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -47,7 +48,139 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("KBNewspaperScraper")
+# ---------------------
 
+# --- Retry Decorator for API Calls ---
+def retry(max_attempts=5, initial_delay=1, backoff_factor=2):
+    """
+    Decorator for retrying a function with exponential backoff.
+    """
+    def decorator_retry(func):
+        @functools.wraps(func)
+        def wrapper_retry(*args, **kwargs):
+            delay = initial_delay
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        logger.error(f"Function {func.__name__} failed after {max_attempts} attempts.")
+                        raise
+                    else:
+                        logger.warning(f"Error in {func.__name__}: {e}. Retrying in {delay} seconds...")
+                        time.sleep(delay)
+                        delay *= backoff_factor
+        return wrapper_retry
+    return decorator_retry
+# ---------------------------------------
+
+# --- File Integrity: Compute MD5 Checksum ---
+def compute_md5(file_path: Path) -> str:
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+# ----------------------------------------------
+
+# --- Google Drive Integration ---
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+def get_drive_service():
+    """Initialize and return a Google Drive API service instance."""
+    scopes = ['https://www.googleapis.com/auth/drive']
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=scopes)
+    return build('drive', 'v3', credentials=creds)
+
+@retry()
+def upload_to_drive(file_path: Path, file_name: str, folder_id: Optional[str] = None) -> str:
+    """
+    Upload a file to Google Drive and verify its integrity.
+    
+    Returns the uploaded file's ID if the MD5 checksum matches.
+    """
+    service = get_drive_service()
+    file_metadata = {'name': file_name}
+    if folder_id:
+        file_metadata['parents'] = [folder_id]
+    
+    # Determine MIME type based on file extension.
+    if str(file_path).lower().endswith('.jp2'):
+        mime_type = 'image/jp2'
+    elif str(file_path).lower().endswith(('.jpg', '.jpeg')):
+        mime_type = 'image/jpeg'
+    else:
+        mime_type = 'application/octet-stream'
+    
+    media = MediaFileUpload(str(file_path), mimetype=mime_type)
+    # Request md5Checksum along with id.
+    uploaded_file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, md5Checksum'
+    ).execute()
+    
+    local_md5 = compute_md5(file_path)
+    remote_md5 = uploaded_file.get("md5Checksum")
+    if local_md5 != remote_md5:
+        raise ValueError(f"MD5 mismatch for {file_name}: local({local_md5}) != remote({remote_md5})")
+    
+    logger.info(f"MD5 check passed for {file_name}")
+    return uploaded_file.get('id')
+
+@retry()
+def get_or_create_drive_folder(service, folder_name: str, parent_id: Optional[str] = None) -> str:
+    """
+    Get or create a folder in Google Drive.
+    
+    Returns the folder ID.
+    """
+    query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    response = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    files = response.get('files', [])
+    if files:
+        folder_id = files[0]['id']
+        logger.debug(f"Found existing folder '{folder_name}' with ID: {folder_id}")
+        return folder_id
+    else:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        if parent_id:
+            file_metadata['parents'] = [parent_id]
+        folder = service.files().create(body=file_metadata, fields='id').execute()
+        folder_id = folder.get('id')
+        logger.info(f"Created folder '{folder_name}' with ID: {folder_id}")
+        return folder_id
+
+@retry()
+def share_drive_folder(service, folder_id: str, email: str):
+    """
+    Share a Google Drive folder with a specified email.
+    """
+    permission = {
+        'type': 'user',
+        'role': 'writer',
+        'emailAddress': email
+    }
+    service.permissions().create(fileId=folder_id, body=permission, fields='id').execute()
+    logger.info(f"Shared folder ID {folder_id} with {email}")
+
+def file_exists_in_drive_folder(service, file_name: str, folder_id: str) -> bool:
+    """
+    Check if a file with the given name exists in the specified Drive folder.
+    """
+    query = f"name='{file_name}' and '{folder_id}' in parents and trashed=false"
+    response = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    files = response.get('files', [])
+    return len(files) > 0
+# --- End Google Drive Integration ---
 
 @dataclass
 class NewspaperIssue:
@@ -56,26 +189,17 @@ class NewspaperIssue:
     date: str
     manifest_id: str
     filenames: List[str] = None
-    drive_links: List[Dict[str, Any]] = None
     
     def __post_init__(self):
-        """Initialize optional fields with empty lists."""
         if self.filenames is None:
             self.filenames = []
-        if self.drive_links is None:
-            self.drive_links = []
-
-    def to_json(self):
-        """Convert to JSON-serializable dict."""
-        return asdict(self)
-
 
 class KBNewspaperScraper:
     """
     A scraper for the KB (Kungliga biblioteket) digital newspaper archive.
     
     Fetches newspaper pages as JP2 files based on date ranges and optional filters.
-    Uses Selenium for web navigation and direct HTTP requests for file downloads.
+    Uses Selenium for web navigation and HTTP requests for file downloads.
     """
     
     BASE_URL = "https://tidningar.kb.se"
@@ -83,50 +207,22 @@ class KBNewspaperScraper:
     API_BASE_URL = "https://data.kb.se"
     
     def __init__(self, download_dir: str = "newspaper_downloads", headless: bool = True, 
-                 retry_count: int = 3, wait_time: int = 20, 
-                 credentials_file: str = None, credentials_json: str = None,
-                 share_with_email: str = None, delete_after_upload: bool = True):
+                 retry_count: int = 3, wait_time: int = 20, drive_parent_folder_id: Optional[str] = None):
         """
-        Initialize the scraper with configurable options.
+        Initialize the scraper.
         
         Args:
-            download_dir: Directory where newspaper files will be downloaded
-            headless: Whether to run the browser in headless mode
-            retry_count: Number of times to retry failed operations
-            wait_time: Maximum wait time in seconds for page elements to load
-            credentials_file: Path to Google Drive service account credentials
-            credentials_json: JSON string with Google Drive service account credentials
-            share_with_email: Email to share uploaded files with (your account)
-            delete_after_upload: Whether to delete local files after uploading to Drive
+            download_dir: Directory for temporary local downloads.
+            headless: Whether to run the browser in headless mode.
+            retry_count: Number of times to retry failed operations.
+            wait_time: Maximum wait time in seconds for page elements.
+            drive_parent_folder_id: Google Drive folder ID under which uploads should go.
         """
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.retry_count = retry_count
-        self.delete_after_upload = delete_after_upload
-        self.share_with_email = share_with_email
+        self.drive_parent_folder_id = drive_parent_folder_id
         
-        # Initialize Google Drive uploader if credentials provided
-        self.drive_uploader = None
-        if GoogleDriveUploader:
-            try:
-                if credentials_file or credentials_json:
-                    self.drive_uploader = GoogleDriveUploader(
-                        credentials_file=credentials_file,
-                        credentials_json=credentials_json,
-                        root_folder_name="KB_Newspapers"
-                    )
-                    
-                    # Share the root folder with the specified email
-                    if share_with_email:
-                        self.drive_uploader.share_root_folder(share_with_email)
-                    
-                    logger.info("Google Drive uploader initialized successfully")
-                else:
-                    logger.warning("No Google Drive credentials provided. Will download files locally only.")
-            except Exception as e:
-                logger.error(f"Failed to initialize Google Drive uploader: {e}", exc_info=True)
-        
-        # Setup Selenium with Chrome
         chrome_options = Options()
         if headless:
             chrome_options.add_argument("--headless")
@@ -134,8 +230,6 @@ class KBNewspaperScraper:
         chrome_options.add_argument("--window-size=1920,1080")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        
-        # Set user agent to mimic a real browser
         chrome_options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -154,136 +248,67 @@ class KBNewspaperScraper:
             raise
     
     def extract_manifest_id_from_html(self, html_content: str) -> Optional[str]:
-        """
-        Extract the manifest ID from the HTML content.
-        
-        Args:
-            html_content: HTML content to extract manifest ID from
-            
-        Returns:
-            The manifest ID if found, otherwise None
-        """
-        # Look for the pattern in data-src or src attributes
         pattern = r'data-src="https://data\.kb\.se/iiif/\d+/([^/%]+)'
         match = re.search(pattern, html_content)
-        
         if match:
             return match.group(1)
-        
-        # Try alternative pattern if the first one didn't match
         pattern = r'src="https://data\.kb\.se/iiif/\d+/([^/%]+)'
         match = re.search(pattern, html_content)
-        
         if match:
             return match.group(1)
-        
         return None
     
     def extract_date_from_html(self, html_content: str) -> Optional[str]:
-        """
-        Extract the newspaper date from HTML content.
-        
-        Args:
-            html_content: HTML content to extract date from
-            
-        Returns:
-            Date string in format 'YYYY-MM-DD' if found, otherwise None
-        """
-        # Try to find date in the search result item date field
         date_pattern = r'<p class="search-result-item-date[^>]*>([^<]+)</p>'
         match = re.search(date_pattern, html_content)
         if match:
             return match.group(1).strip()
-            
-        # Try to extract from title tag if available
         title_pattern = r'<title>([^|]+)\s+(\d{4}-\d{2}-\d{2})\s*[|]'
         match = re.search(title_pattern, html_content)
         if match:
             return match.group(2).strip()
-            
-        # Try to extract from filename in image source
         filename_pattern = r'bib\d+_(\d{4})(\d{2})(\d{2})_'
         match = re.search(filename_pattern, html_content)
         if match:
             return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-            
         return None
     
     def extract_filenames_from_html(self, html_content: str) -> List[str]:
-        """
-        Extract potential JP2 filenames from HTML content.
-        
-        Args:
-            html_content: HTML content to extract filenames from
-            
-        Returns:
-            List of JP2 filenames found in the HTML
-        """
-        # Extract filenames from image URLs
         filename_pattern = r'(bib\d+_\d+_\d+_\d+_\d+\.jp2)'
         matches = re.findall(filename_pattern, html_content)
-        return list(set(matches))  # Return unique filenames
+        return list(set(matches))
     
     def extract_title_and_date_from_page_head(self, page_source: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Extract title and date from the HTML head section.
-        
-        Args:
-            page_source: HTML source of the page
-            
-        Returns:
-            Tuple of (title, date) if found, otherwise (None, None)
-        """
         try:
-            # Extract from title tag
             title_pattern = r'<title>([^|]+?)(?:\s+(\d{4}-\d{2}-\d{2}))?\s*[|]'
             match = re.search(title_pattern, page_source)
-            
             if match:
                 title = match.group(1).strip()
                 date = match.group(2).strip() if match.group(2) else None
-                
-                # If date wasn't in the title tag directly, try meta tags
                 if not date:
                     meta_pattern = r'<meta[^>]*og:title[^>]*content="[^"]*?\s+(\d{4}-\d{2}-\d{2})"'
                     meta_match = re.search(meta_pattern, page_source)
                     if meta_match:
                         date = meta_match.group(1)
-                
                 return title, date
-            
             return None, None
         except Exception as e:
             logger.error(f"Error extracting title and date from head: {e}")
             return None, None
     
     def extract_jp2_from_manifest_data(self, manifest_url: str) -> List[str]:
-        """
-        Extract JP2 file URLs directly from the manifest data.
-        
-        Args:
-            manifest_url: Base URL of the manifest without /manifest suffix
-            
-        Returns:
-            List of JP2 file URLs
-        """
         try:
             logger.info(f"Fetching manifest data from: {manifest_url}")
-            
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept': 'application/json, text/plain, */*',
                 'Referer': 'https://tidningar.kb.se/',
             }
-            
             response = requests.get(f"{manifest_url}/manifest", headers=headers)
             response.raise_for_status()
-            
             manifest_data = response.json()
             jp2_urls = []
             filenames = []
-            
-            # Extract JP2 URLs and filenames from the manifest items
             if 'items' in manifest_data:
                 for canvas in manifest_data['items']:
                     if 'items' in canvas:
@@ -294,175 +319,85 @@ class KBNewspaperScraper:
                                         body_id = annotation['body']['id']
                                         if body_id.endswith('.jp2'):
                                             jp2_urls.append(body_id)
-                                            # Extract filename from the URL
                                             filename = body_id.split('/')[-1]
                                             filenames.append(filename)
-            
-            # If we extracted filenames, log them for debugging
             if filenames:
                 logger.info(f"Extracted {len(filenames)} filenames from manifest")
-                for filename in filenames[:5]:  # Log first few
+                for filename in filenames[:5]:
                     logger.debug(f" - {filename}")
-            
             return jp2_urls
-        
         except Exception as e:
             logger.error(f"Error extracting JP2 files from manifest: {e}", exc_info=True)
             return []
     
     def download_file(self, url: str, filepath: Path) -> bool:
-        """
-        Download a file from URL to the specified filepath.
-        
-        Args:
-            url: URL of the file to download
-            filepath: Local path where the file will be saved
-            
-        Returns:
-            True if download was successful, False otherwise
-        """
         try:
+            start_time = time.time()
             logger.info(f"Downloading {url} to {filepath}")
-            
-            # Skip if file already exists
             if filepath.exists():
                 logger.info(f"File already exists: {filepath}")
                 return True
-            
-            # Make request with appropriate headers
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Referer': 'https://tidningar.kb.se/',
                 'Accept': 'image/jpeg, image/png, image/jp2, */*'
             }
-            
-            # Clean URL for any encoding issues
             clean_url = url.replace('\\\\', '/').replace('\\/', '/')
-            
-            # Retry mechanism for robustness
             for attempt in range(self.retry_count):
                 try:
                     response = requests.get(clean_url, headers=headers, stream=True, timeout=30)
                     response.raise_for_status()
-                    
-                    # Create directory if it doesn't exist
                     filepath.parent.mkdir(parents=True, exist_ok=True)
-                    
                     with open(filepath, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    
-                    logger.info(f"Downloaded: {filepath}")
+                    elapsed = time.time() - start_time
+                    logger.info(f"Downloaded: {filepath} in {elapsed:.2f} seconds")
                     return True
-                    
                 except (requests.exceptions.RequestException, requests.exceptions.Timeout) as req_err:
                     if attempt < self.retry_count - 1:
                         logger.warning(f"Retry {attempt+1}/{self.retry_count} downloading {clean_url}: {req_err}")
-                        time.sleep(2)  # Wait before retrying
+                        time.sleep(2)
                     else:
                         raise
-            
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}", exc_info=True)
             return False
     
-    def upload_to_drive(self, local_path: Path) -> Dict[str, Any]:
-        """
-        Upload a file to Google Drive.
-        
-        Args:
-            local_path: Path to the file to upload
-            
-        Returns:
-            Dictionary with upload result information
-        """
-        if not self.drive_uploader:
-            return {"success": False, "error": "Google Drive uploader not initialized"}
-        
-        try:
-            # Upload the file to Drive
-            result = self.drive_uploader.upload_file(
-                str(local_path),
-                str(self.download_dir),
-                share_with_email=self.share_with_email
-            )
-            
-            # Delete the local file if configured to do so and upload was successful
-            if result["success"] and self.delete_after_upload:
-                try:
-                    os.remove(local_path)
-                    logger.info(f"Deleted local file after upload: {local_path}")
-                except OSError as e:
-                    logger.warning(f"Failed to delete local file {local_path}: {e}")
-            
-            return result
-        
-        except Exception as e:
-            logger.error(f"Error uploading {local_path} to Drive: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
-    
     def process_search_result(self, result: WebElement) -> Optional[NewspaperIssue]:
-        """
-        Process a single search result element.
-        
-        Args:
-            result: Selenium WebElement representing a search result
-            
-        Returns:
-            NewspaperIssue object if successfully processed, None otherwise
-        """
         try:
-            # Extract date and title
             newspaper_title = None
             newspaper_date = None
-            
-            # Find date element
             date_elements = result.find_elements(By.CSS_SELECTOR, "p.search-result-item-date")
             if date_elements:
                 newspaper_date = date_elements[0].text.strip()
-            
-            # Find title element
             title_elements = result.find_elements(By.CSS_SELECTOR, "div.search-result-item-title")
             if title_elements:
                 newspaper_title = title_elements[0].text.strip()
-            
             logger.info(f"Processing issue: {newspaper_title} - {newspaper_date}")
-            
-            # Get the inner HTML to extract the manifest ID directly
             inner_html = result.get_attribute('innerHTML')
             logger.debug("Extracting manifest ID from inner HTML")
-            
             manifest_id = self.extract_manifest_id_from_html(inner_html)
-            
-            # Extract or verify date from HTML if not already found
             if not newspaper_date:
                 extracted_date = self.extract_date_from_html(inner_html)
                 if extracted_date:
                     newspaper_date = extracted_date
                     logger.info(f"Extracted date from HTML: {newspaper_date}")
-            
-            # Try to extract potential JP2 filenames directly from the HTML
             potential_filenames = self.extract_filenames_from_html(inner_html)
             if potential_filenames:
                 logger.info(f"Found {len(potential_filenames)} potential JP2 filenames in HTML")
-                for filename in potential_filenames[:3]:  # Log first few for debugging
+                for filename in potential_filenames[:3]:
                     logger.debug(f" - {filename}")
-            
             if manifest_id:
                 logger.info(f"Found manifest ID from HTML: {manifest_id}")
-                
-                # Clean newspaper_title for folder name
                 if newspaper_title:
                     newspaper_title = re.sub(r'[^\w\s-]', '', newspaper_title).strip()
                 else:
                     newspaper_title = "Unknown"
-                    
                 if newspaper_date:
-                    # Convert date format if needed
                     newspaper_date = newspaper_date.replace('/', '-')
                 else:
                     newspaper_date = "Unknown_Date"
-                
                 return NewspaperIssue(
                     title=newspaper_title,
                     date=newspaper_date,
@@ -472,190 +407,93 @@ class KBNewspaperScraper:
             else:
                 logger.warning("Failed to extract manifest ID from HTML")
                 return None
-                
         except Exception as e:
             logger.error(f"Error processing search result: {e}", exc_info=True)
             return None
     
     def download_newspaper_issue(self, issue: NewspaperIssue) -> bool:
         """
-        Download all files for a newspaper issue and upload to Google Drive.
-        
-        Args:
-            issue: NewspaperIssue object containing metadata
-            
-        Returns:
-            True if all downloads and uploads were successful, False otherwise
+        Download all files for a newspaper issue, upload them to Google Drive under a folder structure:
+        TOP_FOLDER_NAME -> issue title -> issue date, and then remove the local copies.
         """
         try:
-            manifest_url = f"{self.API_BASE_URL}/iiif/2/{issue.manifest_id}"
-            
-            # Create folder for this newspaper and date
+            manifest_url = f"{self.API_BASE_URL}/{issue.manifest_id}"
             folder_path = self.download_dir / issue.title / issue.date
             folder_path.mkdir(parents=True, exist_ok=True)
-            
-            # Get JP2 files from the manifest
             jp2_urls = self.extract_jp2_from_manifest_data(manifest_url)
             logger.info(f"Found {len(jp2_urls)} JP2 files from manifest data")
-            
             if not jp2_urls:
                 logger.warning(f"No JP2 files found for {issue.title} - {issue.date}")
                 return False
             
-            # Download each JP2 file and upload to Drive
+            drive_service = get_drive_service()
+            if self.drive_parent_folder_id:
+                title_folder_id = get_or_create_drive_folder(drive_service, issue.title, parent_id=self.drive_parent_folder_id)
+                date_folder_id = get_or_create_drive_folder(drive_service, issue.date, parent_id=title_folder_id)
+            else:
+                date_folder_id = None
+            
             success_count = 0
             for file_url in jp2_urls:
                 filename = Path(unquote(file_url)).name
                 file_path = folder_path / filename
-                
-                # Download the file locally
+
+                # Skip download if the file already exists in Drive.
+                if date_folder_id and file_exists_in_drive_folder(drive_service, filename, date_folder_id):
+                    logger.info(f"File {filename} already exists on Google Drive. Skipping download.")
+                    success_count += 1
+                    continue
+
                 if self.download_file(file_url, file_path):
-                    # Upload to Google Drive if uploader is available
-                    if self.drive_uploader:
-                        upload_result = self.upload_to_drive(file_path)
-                        
-                        if upload_result["success"]:
-                            # Store the Drive information for reporting
-                            issue.drive_links.append({
-                                "filename": filename,
-                                "file_id": upload_result["file_id"],
-                                "drive_path": upload_result["drive_path"]
-                            })
-                            success_count += 1
-                        else:
-                            logger.error(f"Failed to upload {file_path} to Drive: {upload_result.get('error', 'Unknown error')}")
-                    else:
-                        # If no Drive uploader, just count local download as success
+                    start_upload = time.time()
+                    try:
+                        drive_file_id = upload_to_drive(file_path, file_name=filename, folder_id=date_folder_id)
+                        elapsed_upload = time.time() - start_upload
+                        logger.info(f"Uploaded {filename} to Google Drive with ID: {drive_file_id} in {elapsed_upload:.2f} seconds")
                         success_count += 1
-                else:
-                    logger.warning(f"Failed to download {file_url}")
-            
-            # Check if all files were processed successfully
+                        file_path.unlink()  # Remove local file after successful upload.
+                    except Exception as upload_err:
+                        logger.error(f"Failed to upload {filename} to Google Drive: {upload_err}", exc_info=True)
             return success_count == len(jp2_urls)
-            
         except Exception as e:
             logger.error(f"Error downloading newspaper issue: {e}", exc_info=True)
             return False
     
-    def save_state(self, issues, state_file="scraper_state.json"):
-        """
-        Save the current state of processed issues to a file.
-        
-        Args:
-            issues: List of NewspaperIssue objects
-            state_file: Path to the state file
-        """
-        try:
-            # Convert issues to serializable format
-            serialized_issues = [issue.to_json() for issue in issues]
-            
-            # Read existing state if it exists
-            state = {}
-            if Path(state_file).exists():
-                with open(state_file, 'r', encoding='utf-8') as f:
-                    try:
-                        state = json.load(f)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Could not parse state file {state_file}, creating new state")
-            
-            # Add or update with new issues
-            if "issues" not in state:
-                state["issues"] = []
-            
-            # Add new issues to state
-            for issue_data in serialized_issues:
-                # Check if issue already exists by manifest_id
-                existing = next((i for i in state["issues"] if i["manifest_id"] == issue_data["manifest_id"]), None)
-                if existing:
-                    # Update existing issue
-                    existing.update(issue_data)
-                else:
-                    # Add new issue
-                    state["issues"].append(issue_data)
-            
-            # Update timestamp
-            state["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Write the state back to file
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
-                
-            logger.info(f"Saved state with {len(state['issues'])} issues to {state_file}")
-            
-        except Exception as e:
-            logger.error(f"Error saving state: {e}", exc_info=True)
-    
-    def scrape_by_date_range(self, start_date: str, end_date: str, paper_id: str = None, state_file: str = "scraper_state.json") -> List[NewspaperIssue]:
-        """
-        Scrape newspapers within a date range.
-        
-        Args:
-            start_date: String in format 'YYYY-MM-DD'
-            end_date: String in format 'YYYY-MM-DD'
-            paper_id: Optional paper ID to filter by
-            state_file: Path to the state file for tracking progress
-            
-        Returns:
-            List of NewspaperIssue objects that were successfully scraped
-        """
-        # Validate date formats
-        date_pattern = r'^\d{4}-\d{2}-\d{2}'
+    def scrape_by_date_range(self, start_date: str, end_date: str, paper_id: str = None) -> List[NewspaperIssue]:
+        date_pattern = r'^\d{4}-\d{2}-\d{2}$'
         if not re.match(date_pattern, start_date) or not re.match(date_pattern, end_date):
             logger.error(f"Invalid date format. Must be YYYY-MM-DD. Got: {start_date} to {end_date}")
             return []
-        
-        # Construct the URL with date filters
         url = f"{self.SEARCH_URL}?q=%2a&from={start_date}&to={end_date}"
-        
-        # Add paper filter if provided
         if paper_id:
             url += f"&isPartOf.%40id={paper_id}"
         else:
-            # Use the Dagens Nyheter paper ID by default
             url += "&isPartOf.%40id=https%3A%2F%2Flibris.kb.se%2Fm5z2w4lz3m2zxpk%23it"
-            
         logger.info(f"Using search URL: {url}")
-        
         logger.info(f"Navigating to search page: {url}")
         self.driver.get(url)
-        time.sleep(3)  # Allow page to load
-
-        # Find all search results
+        time.sleep(3)
         try:
             results = self.wait.until(
                 EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.search-result-item"))
             )
-            
             logger.info(f"Found {len(results)} newspaper issues")
-            
             processed_issues = []
-            
-            # Process each result
             for i, result in enumerate(results):
                 try:
                     logger.info(f"Processing result {i+1}/{len(results)}")
-                    
-                    # Extract information from the search result
                     issue = self.process_search_result(result)
-                    
                     if issue:
-                        # Download the issue
                         success = self.download_newspaper_issue(issue)
                         if success:
                             processed_issues.append(issue)
                             logger.info(f"Successfully downloaded issue: {issue.title} - {issue.date}")
-                            
-                            # Save state after each successful issue to track progress
-                            self.save_state(processed_issues, state_file)
                         else:
                             logger.warning(f"Failed to download issue: {issue.title} - {issue.date}")
-                    
                 except Exception as e:
                     logger.error(f"Error processing result {i+1}: {e}", exc_info=True)
                     continue
-            
             return processed_issues
-                
         except TimeoutException:
             logger.error("Timeout waiting for search results")
             return []
@@ -668,9 +506,8 @@ class KBNewspaperScraper:
         logger.info("Closing WebDriver")
         try:
             self.driver.quit()
-        except:
+        except Exception:
             pass
-
 
 def main():
     """Main entry point for the scraper."""
@@ -678,43 +515,24 @@ def main():
     parser.add_argument('--start-date', type=str, required=True, help='Start date in YYYY-MM-DD format')
     parser.add_argument('--end-date', type=str, required=True, help='End date in YYYY-MM-DD format')
     parser.add_argument('--paper-id', type=str, help='Optional paper ID to filter by')
-    parser.add_argument('--download-dir', type=str, default='kb_newspapers', help='Directory to save downloads')
+    parser.add_argument('--download-dir', type=str, default='kb_newspapers', help='Directory for temporary downloads')
     parser.add_argument('--headless', action='store_true', help='Run browser in headless mode')
     parser.add_argument('--log-level', type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO', 
                         help='Logging level')
-    parser.add_argument('--credentials-file', type=str, help='Path to Google Drive service account credentials file')
-    parser.add_argument('--share-with', type=str, help='Email address to share uploaded files with')
-    parser.add_argument('--keep-local', action='store_true', help='Keep local files after uploading to Drive')
-    
     args = parser.parse_args()
-    
-    # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    # Check for credentials in environment variable if not provided as argument
-    credentials_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
-    credentials_file = args.credentials_file or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    drive_service = get_drive_service()
+    newspapers_folder_id = get_or_create_drive_folder(drive_service, TOP_FOLDER_NAME)
+    share_drive_folder(drive_service, newspapers_folder_id, SHARED_EMAIL)
     
-    scraper = KBNewspaperScraper(
-        download_dir=args.download_dir, 
-        headless=args.headless,
-        credentials_file=credentials_file,
-        credentials_json=credentials_json,
-        share_with_email=args.share_with,
-        delete_after_upload=not args.keep_local
-    )
-    
+    scraper = KBNewspaperScraper(download_dir=args.download_dir, headless=args.headless,
+                                  drive_parent_folder_id=newspapers_folder_id)
     try:
         issues = scraper.scrape_by_date_range(args.start_date, args.end_date, args.paper_id)
         logger.info(f"Completed scraping. Downloaded {len(issues)} issues successfully.")
-        
-        # Report Drive statistics if using Drive uploader
-        if scraper.drive_uploader:
-            total_files = sum(len(issue.drive_links) for issue in issues)
-            logger.info(f"Uploaded {total_files} files to Google Drive")
     finally:
         scraper.close()
-
 
 if __name__ == "__main__":
     main()
