@@ -84,7 +84,7 @@ jobs:
             echo "----------------------------------------------------------------"
             
             # Run the scraper for this day (adjust the script name as needed)
-            python kb_newspaper_scraper.py \
+            python src/01-scrape-images.py \
               --start-date "$DATE" \
               --end-date "$NEXT_DATE" \
               --download-dir kb_newspapers \
