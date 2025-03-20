@@ -43,7 +43,6 @@ jobs:
           echo "After cleanup:"
           df -h
 
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -65,11 +64,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
-      - name: Configure Git
+          # Install Google Drive API libraries
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+      
+      - name: Set up Google Drive credentials
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          echo '${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT }}' > service-account.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=service-account.json" >> $GITHUB_ENV
+      
+      - name: Download drive_utils.py
+        run: |
+          wget -q https://raw.githubusercontent.com/${{ github.repository }}/main/drive_utils.py || \
+          echo "drive_utils.py not found in repository, will use local copy"
           
       # When starting a new month, process each day sequentially
       - name: Start month - Process days sequentially
@@ -100,55 +106,22 @@ jobs:
             echo "Processing day $day ($DATE) of $YEAR-$MONTH"
             echo "----------------------------------------------------------------"
             
-            # Run the scraper for this day
-            python src/01-scrape-images.py --start-date "$DATE" --end-date "$NEXT_DATE" --download-dir kb_newspapers --headless
+            # Run the scraper for this day with Google Drive upload
+            python 01-scrape-images.py \
+              --start-date "$DATE" \
+              --end-date "$NEXT_DATE" \
+              --download-dir kb_newspapers \
+              --headless \
+              --credentials-file service-account.json \
+              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
+              --log-level INFO
             
-            # Pull the latest changes to avoid conflicts
-            git fetch origin main
-            
-            # Attempt to merge any remote changes; use ours (local) strategy for conflicts
-            if git merge origin/main -X ours --no-edit; then
-              echo "Successfully merged remote changes"
-            else
-              echo "Merge conflicts detected, resolving with our version"
-              git reset --mixed origin/main
-              git add -A
-            fi
-            
-            # Check if the kb_newspapers directory exists before attempting to add it
-            if [ -d "kb_newspapers" ]; then
-              git add kb_newspapers/
-            else
-              echo "Warning: kb_newspapers directory not found, skipping git add"
-            fi
-            
-            # Check if the state file exists
-            if [ -f "scraper_state.json" ]; then
-              git add scraper_state.json
-            else
-              echo "Warning: scraper_state.json not found, skipping git add"
-              # Create an empty state file to avoid errors in future iterations
-              echo "{}" > scraper_state.json
-            fi
-            
-            # Attempt to commit and push with retries
-            git commit -m "Add scraped newspaper images for $DATE [skip ci]" || echo "No changes to commit for $DATE"
-            
-            # Try to push with up to 3 retries
-            MAX_RETRIES=3
-            for attempt in $(seq 1 $MAX_RETRIES); do
-              if git push origin main; then
-                echo "Successfully pushed changes for $DATE"
-                break
-              else
-                if [ $attempt -lt $MAX_RETRIES ]; then
-                  echo "Push failed on attempt $attempt of $MAX_RETRIES, pulling and retrying..."
-                  git pull origin main --rebase
-                else
-                  echo "Failed to push after $MAX_RETRIES attempts for $DATE, continuing with next day"
-                fi
-              fi
-            done
+            # Commit the state file to track progress
+            git config --global user.name "GitHub Actions"
+            git config --global user.email "actions@github.com"
+            git add scraper_state.json
+            git commit -m "Update scraper state for $DATE [skip ci]" || echo "No changes to commit for $DATE"
+            git push origin main || echo "Failed to push changes, will try again next run"
             
             # Optional: Add a small delay between days to avoid rate limiting
             sleep 5
@@ -159,67 +132,39 @@ jobs:
         if: ${{ github.event.inputs.operation != 'start-month' }}
         run: |
           if [ "${{ github.event.inputs.operation }}" = "continue-scraping" ]; then
-            python src/01-scrape-images.py --download-dir kb_newspapers --headless
+            python 01-scrape-images.py \
+              --download-dir kb_newspapers \
+              --headless \
+              --credentials-file service-account.json \
+              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
+              --log-level INFO
           elif [ "${{ github.event.inputs.operation }}" = "retry-failed" ]; then
-            python src/01-scrape-images.py --retry-failed --download-dir kb_newspapers --headless
+            python 01-scrape-images.py \
+              --retry-failed \
+              --download-dir kb_newspapers \
+              --headless \
+              --credentials-file service-account.json \
+              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
+              --log-level INFO
           elif [ "${{ github.event.inputs.operation }}" = "verify-month" ]; then
-            python src/01-scrape-images.py --verify-month --download-dir kb_newspapers --headless
+            python 01-scrape-images.py \
+              --verify-month \
+              --download-dir kb_newspapers \
+              --headless \
+              --credentials-file service-account.json \
+              --share-with ${{ secrets.GOOGLE_DRIVE_SHARE_EMAIL }} \
+              --log-level INFO
           fi
-          
-      # Commit changes for other operations
-      - name: Commit and push changes for other operations
+      
+      # Commit the state file regardless of operation
+      - name: Commit state file
         if: ${{ github.event.inputs.operation != 'start-month' }}
         run: |
-          # Create an empty state file if it doesn't exist
-          if [ ! -f "scraper_state.json" ]; then
-            echo "{}" > scraper_state.json
-            echo "Created empty scraper_state.json file"
-          fi
-          
-          # Pull the latest changes to avoid conflicts
-          git fetch origin main
-            
-          # Attempt to merge any remote changes; use ours (local) strategy for conflicts
-          if git merge origin/main -X ours --no-edit; then
-            echo "Successfully merged remote changes"
-          else
-            echo "Merge conflicts detected, resolving with our version"
-            git reset --mixed origin/main
-            git add -A
-          fi
-          
-          # Check if the kb_newspapers directory exists before attempting to add it
-          if [ -d "kb_newspapers" ]; then
-            git add kb_newspapers/
-          else
-            echo "Warning: kb_newspapers directory not found, skipping git add"
-          fi
-          
-          # Check if the state file exists
-          if [ -f "scraper_state.json" ]; then
-            git add scraper_state.json
-          else
-            echo "Warning: scraper_state.json not found, skipping git add"
-          fi
-          
-          # Attempt to commit and push with retries
-          git commit -m "Update scraped data for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
-          
-          # Try to push with up to 3 retries
-          MAX_RETRIES=3
-          for attempt in $(seq 1 $MAX_RETRIES); do
-            if git push origin main; then
-              echo "Successfully pushed changes"
-              break
-            else
-              if [ $attempt -lt $MAX_RETRIES ]; then
-                echo "Push failed on attempt $attempt of $MAX_RETRIES, pulling and retrying..."
-                git pull origin main --rebase
-              else
-                echo "Failed to push after $MAX_RETRIES attempts"
-              fi
-            fi
-          done
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add scraper_state.json
+          git commit -m "Update scraper state for ${{ github.event.inputs.operation }} [skip ci]" || echo "No changes to commit"
+          git push origin main || echo "Failed to push changes"
           
       # Upload logs as artifacts
       - name: Upload scraper logs
@@ -232,6 +177,7 @@ jobs:
             *.log
             kb_newspaper_cron.log
             kb_scraper.log
+            drive_upload.log
             
       - name: Upload scraper state
         uses: actions/upload-artifact@v4

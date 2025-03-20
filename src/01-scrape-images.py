@@ -5,16 +5,18 @@ KB Newspaper Scraper
 
 A production-ready scraper for the KB newspaper archive.
 Fetches newspaper images from the KB digital archive based on date ranges.
+Now uploads to Google Drive instead of storing in Git.
 """
 
 import os
 import re
 import time
+import json
 import logging
 import argparse
 import requests
 from typing import List, Tuple, Optional, Dict, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -26,6 +28,13 @@ from selenium.webdriver.remote.webelement import WebElement
 from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import urlparse, unquote
 from pathlib import Path
+
+# Import Google Drive uploader
+try:
+    from src.drive_utils import GoogleDriveUploader
+except ImportError:
+    logging.warning("GoogleDriveUploader not found. Will download files locally only.")
+    GoogleDriveUploader = None
 
 
 # Configure logging
@@ -47,11 +56,18 @@ class NewspaperIssue:
     date: str
     manifest_id: str
     filenames: List[str] = None
+    drive_links: List[Dict[str, Any]] = None
     
     def __post_init__(self):
         """Initialize optional fields with empty lists."""
         if self.filenames is None:
             self.filenames = []
+        if self.drive_links is None:
+            self.drive_links = []
+
+    def to_json(self):
+        """Convert to JSON-serializable dict."""
+        return asdict(self)
 
 
 class KBNewspaperScraper:
@@ -67,7 +83,9 @@ class KBNewspaperScraper:
     API_BASE_URL = "https://data.kb.se"
     
     def __init__(self, download_dir: str = "newspaper_downloads", headless: bool = True, 
-                 retry_count: int = 3, wait_time: int = 20):
+                 retry_count: int = 3, wait_time: int = 20, 
+                 credentials_file: str = None, credentials_json: str = None,
+                 share_with_email: str = None, delete_after_upload: bool = True):
         """
         Initialize the scraper with configurable options.
         
@@ -76,10 +94,37 @@ class KBNewspaperScraper:
             headless: Whether to run the browser in headless mode
             retry_count: Number of times to retry failed operations
             wait_time: Maximum wait time in seconds for page elements to load
+            credentials_file: Path to Google Drive service account credentials
+            credentials_json: JSON string with Google Drive service account credentials
+            share_with_email: Email to share uploaded files with (your account)
+            delete_after_upload: Whether to delete local files after uploading to Drive
         """
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.retry_count = retry_count
+        self.delete_after_upload = delete_after_upload
+        self.share_with_email = share_with_email
+        
+        # Initialize Google Drive uploader if credentials provided
+        self.drive_uploader = None
+        if GoogleDriveUploader:
+            try:
+                if credentials_file or credentials_json:
+                    self.drive_uploader = GoogleDriveUploader(
+                        credentials_file=credentials_file,
+                        credentials_json=credentials_json,
+                        root_folder_name="KB_Newspapers"
+                    )
+                    
+                    # Share the root folder with the specified email
+                    if share_with_email:
+                        self.drive_uploader.share_root_folder(share_with_email)
+                    
+                    logger.info("Google Drive uploader initialized successfully")
+                else:
+                    logger.warning("No Google Drive credentials provided. Will download files locally only.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Drive uploader: {e}", exc_info=True)
         
         # Setup Selenium with Chrome
         chrome_options = Options()
@@ -321,6 +366,41 @@ class KBNewspaperScraper:
             logger.error(f"Error downloading {url}: {e}", exc_info=True)
             return False
     
+    def upload_to_drive(self, local_path: Path) -> Dict[str, Any]:
+        """
+        Upload a file to Google Drive.
+        
+        Args:
+            local_path: Path to the file to upload
+            
+        Returns:
+            Dictionary with upload result information
+        """
+        if not self.drive_uploader:
+            return {"success": False, "error": "Google Drive uploader not initialized"}
+        
+        try:
+            # Upload the file to Drive
+            result = self.drive_uploader.upload_file(
+                str(local_path),
+                str(self.download_dir),
+                share_with_email=self.share_with_email
+            )
+            
+            # Delete the local file if configured to do so and upload was successful
+            if result["success"] and self.delete_after_upload:
+                try:
+                    os.remove(local_path)
+                    logger.info(f"Deleted local file after upload: {local_path}")
+                except OSError as e:
+                    logger.warning(f"Failed to delete local file {local_path}: {e}")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error uploading {local_path} to Drive: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+    
     def process_search_result(self, result: WebElement) -> Optional[NewspaperIssue]:
         """
         Process a single search result element.
@@ -399,16 +479,16 @@ class KBNewspaperScraper:
     
     def download_newspaper_issue(self, issue: NewspaperIssue) -> bool:
         """
-        Download all files for a newspaper issue.
+        Download all files for a newspaper issue and upload to Google Drive.
         
         Args:
             issue: NewspaperIssue object containing metadata
             
         Returns:
-            True if all downloads were successful, False otherwise
+            True if all downloads and uploads were successful, False otherwise
         """
         try:
-            manifest_url = f"{self.API_BASE_URL}/{issue.manifest_id}"
+            manifest_url = f"{self.API_BASE_URL}/iiif/2/{issue.manifest_id}"
             
             # Create folder for this newspaper and date
             folder_path = self.download_dir / issue.title / issue.date
@@ -422,22 +502,90 @@ class KBNewspaperScraper:
                 logger.warning(f"No JP2 files found for {issue.title} - {issue.date}")
                 return False
             
-            # Download each JP2 file
+            # Download each JP2 file and upload to Drive
             success_count = 0
             for file_url in jp2_urls:
                 filename = Path(unquote(file_url)).name
                 file_path = folder_path / filename
                 
+                # Download the file locally
                 if self.download_file(file_url, file_path):
-                    success_count += 1
+                    # Upload to Google Drive if uploader is available
+                    if self.drive_uploader:
+                        upload_result = self.upload_to_drive(file_path)
+                        
+                        if upload_result["success"]:
+                            # Store the Drive information for reporting
+                            issue.drive_links.append({
+                                "filename": filename,
+                                "file_id": upload_result["file_id"],
+                                "drive_path": upload_result["drive_path"]
+                            })
+                            success_count += 1
+                        else:
+                            logger.error(f"Failed to upload {file_path} to Drive: {upload_result.get('error', 'Unknown error')}")
+                    else:
+                        # If no Drive uploader, just count local download as success
+                        success_count += 1
+                else:
+                    logger.warning(f"Failed to download {file_url}")
             
+            # Check if all files were processed successfully
             return success_count == len(jp2_urls)
             
         except Exception as e:
             logger.error(f"Error downloading newspaper issue: {e}", exc_info=True)
             return False
     
-    def scrape_by_date_range(self, start_date: str, end_date: str, paper_id: str = None) -> List[NewspaperIssue]:
+    def save_state(self, issues, state_file="scraper_state.json"):
+        """
+        Save the current state of processed issues to a file.
+        
+        Args:
+            issues: List of NewspaperIssue objects
+            state_file: Path to the state file
+        """
+        try:
+            # Convert issues to serializable format
+            serialized_issues = [issue.to_json() for issue in issues]
+            
+            # Read existing state if it exists
+            state = {}
+            if Path(state_file).exists():
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    try:
+                        state = json.load(f)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Could not parse state file {state_file}, creating new state")
+            
+            # Add or update with new issues
+            if "issues" not in state:
+                state["issues"] = []
+            
+            # Add new issues to state
+            for issue_data in serialized_issues:
+                # Check if issue already exists by manifest_id
+                existing = next((i for i in state["issues"] if i["manifest_id"] == issue_data["manifest_id"]), None)
+                if existing:
+                    # Update existing issue
+                    existing.update(issue_data)
+                else:
+                    # Add new issue
+                    state["issues"].append(issue_data)
+            
+            # Update timestamp
+            state["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Write the state back to file
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+                
+            logger.info(f"Saved state with {len(state['issues'])} issues to {state_file}")
+            
+        except Exception as e:
+            logger.error(f"Error saving state: {e}", exc_info=True)
+    
+    def scrape_by_date_range(self, start_date: str, end_date: str, paper_id: str = None, state_file: str = "scraper_state.json") -> List[NewspaperIssue]:
         """
         Scrape newspapers within a date range.
         
@@ -445,12 +593,13 @@ class KBNewspaperScraper:
             start_date: String in format 'YYYY-MM-DD'
             end_date: String in format 'YYYY-MM-DD'
             paper_id: Optional paper ID to filter by
+            state_file: Path to the state file for tracking progress
             
         Returns:
             List of NewspaperIssue objects that were successfully scraped
         """
         # Validate date formats
-        date_pattern = r'^\d{4}-\d{2}-\d{2}$'
+        date_pattern = r'^\d{4}-\d{2}-\d{2}'
         if not re.match(date_pattern, start_date) or not re.match(date_pattern, end_date):
             logger.error(f"Invalid date format. Must be YYYY-MM-DD. Got: {start_date} to {end_date}")
             return []
@@ -495,6 +644,9 @@ class KBNewspaperScraper:
                         if success:
                             processed_issues.append(issue)
                             logger.info(f"Successfully downloaded issue: {issue.title} - {issue.date}")
+                            
+                            # Save state after each successful issue to track progress
+                            self.save_state(processed_issues, state_file)
                         else:
                             logger.warning(f"Failed to download issue: {issue.title} - {issue.date}")
                     
@@ -530,17 +682,36 @@ def main():
     parser.add_argument('--headless', action='store_true', help='Run browser in headless mode')
     parser.add_argument('--log-level', type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO', 
                         help='Logging level')
+    parser.add_argument('--credentials-file', type=str, help='Path to Google Drive service account credentials file')
+    parser.add_argument('--share-with', type=str, help='Email address to share uploaded files with')
+    parser.add_argument('--keep-local', action='store_true', help='Keep local files after uploading to Drive')
     
     args = parser.parse_args()
     
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    scraper = KBNewspaperScraper(download_dir=args.download_dir, headless=args.headless)
+    # Check for credentials in environment variable if not provided as argument
+    credentials_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+    credentials_file = args.credentials_file or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    
+    scraper = KBNewspaperScraper(
+        download_dir=args.download_dir, 
+        headless=args.headless,
+        credentials_file=credentials_file,
+        credentials_json=credentials_json,
+        share_with_email=args.share_with,
+        delete_after_upload=not args.keep_local
+    )
     
     try:
         issues = scraper.scrape_by_date_range(args.start_date, args.end_date, args.paper_id)
         logger.info(f"Completed scraping. Downloaded {len(issues)} issues successfully.")
+        
+        # Report Drive statistics if using Drive uploader
+        if scraper.drive_uploader:
+            total_files = sum(len(issue.drive_links) for issue in issues)
+            logger.info(f"Uploaded {total_files} files to Google Drive")
     finally:
         scraper.close()
 
